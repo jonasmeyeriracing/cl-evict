@@ -25,6 +25,7 @@ DEFINE_GUID(KernelProcessGuid,
 enum KernelProcessEventIds {
     ProcessStart = 1,
     ProcessStop = 2,
+    ProcessRundown = 15,  // DCStart - enumerates already-running processes
 };
 
 // Session name for our trace
@@ -257,18 +258,22 @@ void HandleProcessEvent(PEVENT_RECORD pEvent) {
     // Extract just the filename from the path
     std::wstring fileName = GetFileName(imageName);
 
-    if (eventId == ProcessStart) {
+    if (eventId == ProcessStart || eventId == ProcessRundown) {
         // Check if this is our target process
+        // ProcessRundown (DCStart) enumerates already-running processes at trace start
         if (!fileName.empty() && ToLower(fileName) == ToLower(g_targetProcessName)) {
-            g_targetPid = processId;
-            g_targetProcessRunning = true;
-            ResetTrackingState();  // Start fresh for new process instance
+            // Only set if we don't already have a target (avoid resetting on rundown if already tracking)
+            if (g_targetPid == 0) {
+                g_targetPid = processId;
+                g_targetProcessRunning = true;
 
-            wprintf(L"\n>>> Target process STARTED: %s (PID: %lu)\n", fileName.c_str(), processId);
-            fflush(stdout);
-            if (g_logFile) {
-                fwprintf(g_logFile, L"\n>>> Target process STARTED: %s (PID: %lu)\n", fileName.c_str(), processId);
-                fflush(g_logFile);
+                const wchar_t* eventType = (eventId == ProcessRundown) ? L"DETECTED (already running)" : L"STARTED";
+                wprintf(L"\n>>> Target process %s: %s (PID: %lu)\n", eventType, fileName.c_str(), processId);
+                fflush(stdout);
+                if (g_logFile) {
+                    fwprintf(g_logFile, L"\n>>> Target process %s: %s (PID: %lu)\n", eventType, fileName.c_str(), processId);
+                    fflush(g_logFile);
+                }
             }
         }
     }
@@ -709,17 +714,40 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
 
+    // Request rundown/capture state to enumerate existing GPU allocations (DCStart events)
+    status = EnableTraceEx2(
+        g_sessionHandle,
+        &DxgKrnlGuid,
+        EVENT_CONTROL_CODE_CAPTURE_STATE,
+        TRACE_LEVEL_VERBOSE,
+        0xFFFFFFFFFFFFFFFF,
+        0,
+        0,
+        nullptr
+    );
+
+    if (status != ERROR_SUCCESS) {
+        wprintf(L"Warning: Failed to request DxgKrnl rundown. Error: %lu\n", status);
+        wprintf(L"Existing GPU allocations may not be enumerated.\n");
+        // Continue anyway - new allocations will still be tracked
+    }
+
     // Enable Kernel-Process provider for process start/stop detection
     // Keyword 0x10 = WINEVENT_KEYWORD_PROCESS for process events
+    // Keyword 0x20 = WINEVENT_KEYWORD_PROCESS_RUNDOWN for enumerating existing processes
+    ENABLE_TRACE_PARAMETERS kernelProcessParams = {};
+    kernelProcessParams.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
+    kernelProcessParams.EnableProperty = EVENT_ENABLE_PROPERTY_PROCESS_START_KEY;
+
     status = EnableTraceEx2(
         g_sessionHandle,
         &KernelProcessGuid,
         EVENT_CONTROL_CODE_ENABLE_PROVIDER,
         TRACE_LEVEL_INFORMATION,
-        0x10,  // WINEVENT_KEYWORD_PROCESS
+        0x10 | 0x20,  // WINEVENT_KEYWORD_PROCESS | WINEVENT_KEYWORD_PROCESS_RUNDOWN
         0,
         0,
-        nullptr
+        &kernelProcessParams
     );
 
     if (status != ERROR_SUCCESS) {
