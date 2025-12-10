@@ -75,6 +75,8 @@ enum DxgKrnlEventIds {
 
 // Global state
 static std::atomic<int64_t> g_totalMemoryBytes{ 0 };
+static std::atomic<int64_t> g_residentMemoryBytes{ 0 };
+static std::atomic<int64_t> g_evictedMemoryBytes{ 0 };
 static std::wstring g_targetProcessName;
 static DWORD g_targetPid = 0;
 static std::atomic<bool> g_targetProcessRunning{ false };
@@ -195,6 +197,8 @@ void ResetTrackingState() {
     g_vidMmAllocMap.clear();
     g_lastAdapterAlloc.clear();
     g_totalMemoryBytes = 0;
+    g_residentMemoryBytes = 0;
+    g_evictedMemoryBytes = 0;
 }
 
 // Handle process start/stop events from Microsoft-Windows-Kernel-Process
@@ -262,8 +266,14 @@ void HandleProcessEvent(PEVENT_RECORD pEvent) {
         // Check if this is our target process
         // ProcessRundown (DCStart) enumerates already-running processes at trace start
         if (!fileName.empty() && ToLower(fileName) == ToLower(g_targetProcessName)) {
-            // Only set if we don't already have a target (avoid resetting on rundown if already tracking)
-            if (g_targetPid == 0) {
+            // If we're tracking a different PID, switch to the new one
+            // This handles the case where a new instance starts while we're still tracking the old one
+            if (g_targetPid != 0 && g_targetPid != processId) {
+                // A new instance started - reset state and switch
+                ResetTrackingState();
+            }
+
+            if (g_targetPid == 0 || g_targetPid != processId) {
                 g_targetPid = processId;
                 g_targetProcessRunning = true;
 
@@ -280,15 +290,17 @@ void HandleProcessEvent(PEVENT_RECORD pEvent) {
     else if (eventId == ProcessStop) {
         // Check if our target process stopped - primarily by PID match
         if (processId == g_targetPid && g_targetPid != 0) {
-            wchar_t totalStr[32];
+            wchar_t totalStr[32], residentStr[32], evictedStr[32];
             FormatBytes(g_totalMemoryBytes.load(), totalStr, 32);
+            FormatBytes(g_residentMemoryBytes.load(), residentStr, 32);
+            FormatBytes(g_evictedMemoryBytes.load(), evictedStr, 32);
 
-            wprintf(L"\n>>> Target process STOPPED: %s (PID: %lu) | Final GPU memory: %s\n",
-                    g_targetProcessName.c_str(), processId, totalStr);
+            wprintf(L"\n>>> Target process STOPPED: %s (PID: %lu) | Total: %s | Resident: %s | Evicted: %s\n",
+                    g_targetProcessName.c_str(), processId, totalStr, residentStr, evictedStr);
             fflush(stdout);
             if (g_logFile) {
-                fwprintf(g_logFile, L"\n>>> Target process STOPPED: %s (PID: %lu) | Final GPU memory: %s\n",
-                        g_targetProcessName.c_str(), processId, totalStr);
+                fwprintf(g_logFile, L"\n>>> Target process STOPPED: %s (PID: %lu) | Total: %s | Resident: %s | Evicted: %s\n",
+                        g_targetProcessName.c_str(), processId, totalStr, residentStr, evictedStr);
                 fflush(g_logFile);
             }
 
@@ -362,7 +374,8 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
     // Check if this is an allocation event we care about
     bool isAllocation = false;
     bool isDeallocation = false;
-    bool isResidencyChange = false;
+    bool isMakeResident = false;
+    bool isEvict = false;
     const wchar_t* eventType = L"";
 
     // Track if this is a DeviceAllocation that links AdapterAlloc handle to VidMmAlloc handle
@@ -385,16 +398,25 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
             eventType = taskName;
             break;
 
+        // VidMm residency events - track what's in VRAM vs evicted
+        case VidMmMakeResident:
+        case VidMmMakeResident_DCStart:
+            isMakeResident = true;
+            eventType = L"VidMmMakeResident";
+            break;
+
+        case VidMmEvict:
+            isEvict = true;
+            eventType = L"VidMmEvict";
+            break;
+
         // ProcessAllocation/ProcessAllocationDetails are duplicates - skip
         case ProcessAllocation_Start:
         case ProcessAllocationDetails_Start:
-        case VidMmMakeResident:
-        case VidMmMakeResident_DCStart:
         case AdapterAllocation_Stop:
         case DeviceAllocation_Stop:
         case ProcessAllocation_Stop:
         case ProcessAllocationDetails_Stop:
-        case VidMmEvict:
             // Skip these - they don't add useful size info or are duplicates
             free(pInfo);
             return;
@@ -527,8 +549,8 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
                 // Link the hVidMmAlloc to the allocation size
                 g_vidMmAllocMap[hVidMmAlloc] = lastIt->second.size;
                 if (g_verbose && g_logFile) {
-                    fwprintf(g_logFile, L"[LINK] hVidMmAlloc=0x%llX -> Size=%llu\n",
-                            hVidMmAlloc, lastIt->second.size);
+                    fwprintf(g_logFile, L"[MAP-STORE] hVidMmAlloc=0x%llX -> Size=%llu (map size now %zu)\n",
+                            hVidMmAlloc, lastIt->second.size, g_vidMmAllocMap.size());
                     fflush(g_logFile);
                 }
                 // Clear the last allocation to avoid double-linking
@@ -556,19 +578,72 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
             action = L"FREE";
         }
     }
+    else if (isMakeResident) {
+        // Memory is being made resident in VRAM
+        // VidMm events don't have size - look it up from the handle
+        if (allocationSize == 0 && handle != 0) {
+            std::lock_guard<std::mutex> lock(g_mapMutex);
+            auto it = g_vidMmAllocMap.find(handle);
+            if (it != g_vidMmAllocMap.end()) {
+                allocationSize = it->second;
+                if (g_verbose && g_logFile) {
+                    fwprintf(g_logFile, L"[RESIDENT-HIT] handle=0x%llX size=%llu\n", handle, allocationSize);
+                    fflush(g_logFile);
+                }
+            } else if (g_verbose && g_logFile) {
+                fwprintf(g_logFile, L"[RESIDENT-MISS] handle=0x%llX not in map (map size=%zu)\n", handle, g_vidMmAllocMap.size());
+                fflush(g_logFile);
+            }
+        }
+        if (allocationSize > 0) {
+            delta = (int64_t)allocationSize;
+            g_residentMemoryBytes += delta;
+            g_evictedMemoryBytes -= delta;
+            // Clamp evicted to 0 (can go negative if we didn't see the evict)
+            if (g_evictedMemoryBytes < 0) g_evictedMemoryBytes = 0;
+            action = L"RESIDENT";
+        }
+    }
+    else if (isEvict) {
+        // Memory is being evicted from VRAM
+        // VidMm events don't have size - look it up from the handle
+        if (allocationSize == 0 && handle != 0) {
+            std::lock_guard<std::mutex> lock(g_mapMutex);
+            auto it = g_vidMmAllocMap.find(handle);
+            if (it != g_vidMmAllocMap.end()) {
+                allocationSize = it->second;
+                if (g_verbose && g_logFile) {
+                    fwprintf(g_logFile, L"[EVICT-HIT] handle=0x%llX size=%llu\n", handle, allocationSize);
+                    fflush(g_logFile);
+                }
+            } else if (g_verbose && g_logFile) {
+                fwprintf(g_logFile, L"[EVICT-MISS] handle=0x%llX not in map (map size=%zu)\n", handle, g_vidMmAllocMap.size());
+                fflush(g_logFile);
+            }
+        }
+        if (allocationSize > 0) {
+            delta = (int64_t)allocationSize;
+            g_evictedMemoryBytes += delta;
+            g_residentMemoryBytes -= delta;
+            // Clamp resident to 0 (can go negative if we didn't see the make resident)
+            if (g_residentMemoryBytes < 0) g_residentMemoryBytes = 0;
+            action = L"EVICT";
+        }
+    }
 
     if (delta != 0) {
-        wchar_t sizeStr[32], totalStr[32], deltaStr[32];
+        wchar_t sizeStr[32], totalStr[32], residentStr[32], evictedStr[32];
         FormatBytes((int64_t)allocationSize, sizeStr, 32);
         FormatBytes(g_totalMemoryBytes.load(), totalStr, 32);
-        FormatBytes(delta, deltaStr, 32);
+        FormatBytes(g_residentMemoryBytes.load(), residentStr, 32);
+        FormatBytes(g_evictedMemoryBytes.load(), evictedStr, 32);
 
-        wprintf(L"[PID %5lu] %-6s %-25s | Size: %12s | Delta: %12s | Total: %12s\n",
-                effectivePid, action, eventType, sizeStr, deltaStr, totalStr);
+        wprintf(L"[PID %5lu] %-8s %-22s | Size: %10s | Total: %10s | Resident: %10s | Evicted: %10s\n",
+                effectivePid, action, eventType, sizeStr, totalStr, residentStr, evictedStr);
         fflush(stdout);
         if (g_logFile) {
-            fwprintf(g_logFile, L"[PID %5lu] %-6s %-25s | Size: %12s | Delta: %12s | Total: %12s\n",
-                    effectivePid, action, eventType, sizeStr, deltaStr, totalStr);
+            fwprintf(g_logFile, L"[PID %5lu] %-8s %-22s | Size: %10s | Total: %10s | Resident: %10s | Evicted: %10s\n",
+                    effectivePid, action, eventType, sizeStr, totalStr, residentStr, evictedStr);
             fflush(g_logFile);
         }
     }
